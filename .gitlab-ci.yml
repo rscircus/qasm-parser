@@ -1,0 +1,89 @@
+stages:
+  - build
+  - test
+  - publish
+
+variables:
+  DOCKER_TLS_CERTDIR: "/certs"
+
+.python_matrix:
+  parallel:
+    matrix:
+      - PYTHON_VERSION: ["3.12"]
+
+.install_devcontainers_cli:
+  cache:
+    paths:
+      - .apk_cache
+      - .npm_cache
+  before_script:
+    - mkdir -p .apk_cache && apk add --cache-dir .apk_cache npm
+    - npm install --cache .npm_cache --global --prefer-offline @devcontainers/cli@0.58.0
+
+# Build the Dev Container.
+Build:
+  extends:
+    - .python_matrix
+    - .install_devcontainers_cli
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - |
+      # Log in to the Docker registry.
+      echo "$CI_REGISTRY_PASSWORD" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+ 
+      # Compute a hash for the Dev Container image.
+      export CI_IMAGE_SHA="$(sha1sum Dockerfile poetry.lock pyproject.toml | sha1sum | cut -c 1-8)"
+      echo "CI_IMAGE_SHA=$CI_IMAGE_SHA" >> .env
+      
+      # Build and push the Dev Container image, unless it already exists.
+      IMAGE_NAME="$CI_REGISTRY_IMAGE/devcontainer:$PYTHON_VERSION-$CI_IMAGE_SHA"
+      IMAGE_EXISTS=${IMAGE_EXISTS:-$(timeout 2s docker pull "$IMAGE_NAME" >/dev/null 2>&1 && echo $? || echo $?)}
+      if [ "$IMAGE_EXISTS" -ne 1 ]; then
+        echo "$IMAGE_NAME exists, skipping this job..."
+      else
+        devcontainer build --image-name "$IMAGE_NAME" --workspace-folder .
+        docker push "$IMAGE_NAME"
+      fi
+  artifacts:
+    reports:
+      dotenv: .env
+
+# Lint and test the package.
+Test:
+  extends:
+    - .python_matrix
+    - .install_devcontainers_cli
+  stage: test
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - |
+      devcontainer up --cache-from "type=registry,ref=$CI_REGISTRY_IMAGE/devcontainer:$PYTHON_VERSION-$CI_IMAGE_SHA" --workspace-folder .
+      devcontainer exec --workspace-folder . git config --global --add safe.directory /workspaces/qasm-parser
+      devcontainer exec --workspace-folder . poe lint
+      devcontainer exec --workspace-folder . poe test
+  coverage: '/^TOTAL.*\s+(\d+(?:\.\d+)?)%/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: reports/coverage.xml
+      junit:
+        - reports/mypy.xml
+        - reports/pytest.xml
+    untracked: true
+    when: always
+
+# Publish this package version to PyPI.
+Publish:
+  stage: publish
+  image: $CI_REGISTRY_IMAGE/devcontainer:3.12-$CI_IMAGE_SHA
+  script:
+    - poetry config pypi-token.pypi "$POETRY_PYPI_TOKEN_PYPI"
+    - poetry publish --build
+  only:
+    - tags
